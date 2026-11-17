@@ -15,6 +15,14 @@ print.  When a case has too few weighted observations for an hour the house
 baseline takes over: the first hour's print, with a log spread that widens like
 a random walk's.
 
+Hour 1 is not always a launch hour: for some launches the store had not
+unlocked yet, or only a pre-load stream was live, so their first print is a
+fraction of the next few hours and normalising on it stretches the whole day.
+Such a comparable is detected from its own curve (`dead_air_reason`), then
+either dropped from the pool or re-anchored on the hour its curve really
+reaches its level (`reanchored_ratios`); which of the two, and at what
+threshold, is what `tools/dead_air_sweep.py` measured.
+
 Python 3.13, standard library only, no network, no randomness, no clock: two
 runs over the same case write byte-identical files.
 """
@@ -77,11 +85,38 @@ SIM_UNKNOWN = 0.3  # no usable `platforms` string: neither endorsed nor damned
 
 # Exponent on the platform weight; 0 disables it, 1 is the similarity itself.
 # Swept with the leave-one-out harness in tools/loo_sweep.py: the console
-# launches' mean pinball loss falls from 0.3166 at 0.0 to 0.2727 at 0.5 and
-# rises again past it (0.2775 at 1.0, 0.2902 at 2.0), while the whole pool --
+# launches' mean pinball loss falls from 0.3012 at 0.0 to 0.2672 at 0.5 and
+# rises again past it (0.2761 at 1.0, 0.2908 at 2.0), while the whole pool --
 # which is mostly the PC-led launches this weight deliberately demotes -- pays
-# a little (0.4135 to 0.4434).  0.5 is where the console pool is best.
+# a little (0.4200 to 0.4448).  0.5 is where the console pool is best.
 PLATFORM_EXPONENT = 0.5
+
+# What to do with a comparable whose hour 1 is dead air (see dead_air_reason):
+# leave it alone, drop it from the pool, or re-anchor its ratio curve on the
+# hour its release day really reaches its level.  Swept by
+# tools/dead_air_sweep.py over the four practice cases, leave-one-out, pool =
+# the whole remaining pool: at 0.3 "reanchor" gives the console launches
+# 0.2816 mean / 0.2001 median against 0.2875 / 0.2112 for the unrepaired
+# program, and the whole pool 0.4448 / 0.2829 against 0.4434 / 0.2851; "drop"
+# is worse on both sets and so is every higher threshold.  "none" keeps the
+# old behaviour and is what the sweep's baseline row measures.
+REPAIR_NONE = "none"
+REPAIR_DROP = "drop"
+REPAIR_REANCHOR = "reanchor"
+DEAD_AIR_REPAIR = REPAIR_REANCHOR
+# v1 below this fraction of max(v2..v5) is dead air.  0.2 and 0.3 flag the same
+# single comparable and measure the same; 0.4 and 0.5 flag a second one and
+# cost the pool 0.027 of mean loss against the unrepaired 0.4434.
+DEAD_AIR_THRESHOLD = 0.3
+# The re-anchor: the first hour at this fraction of the release-day peak.
+REANCHOR_FRACTION = 0.6
+
+# The words a comparable's `unlock` prose uses to say hour 1 was not the
+# launch, and the clock times it names.  Read only to annotate a reason the
+# data already gave: a case's comparables and their prose change from case to
+# case, so the data test is the one that decides.
+DEAD_AIR_WORDS = ("preload", "pre-load", "no unlock", "global unlock")
+PROSE_TIME = re.compile(r"\d{1,2}:\d{2}\s*(?:Z|UTC|GMT)", re.IGNORECASE)
 
 LOWEST = 1.0  # no quantile may sit below one viewer
 HIGHEST = 1e9  # ... nor above a billion
@@ -233,6 +268,108 @@ def normalised_ratios(curve):
     return ratios
 
 
+def early_peak(curve):
+    """The highest of hours 2..5, or None when none of them is above zero.
+
+    That is the level the curve has reached a few hours in, the reference the
+    first hour is judged against.
+    """
+    early = [curve[hour] for hour in range(FIRST_HOUR + 1, FIRST_HOUR + 5)
+             if curve.get(hour) is not None and curve[hour] > 0]
+    return max(early) if early else None
+
+
+def prose_hint(comparable):
+    """The pre-load/unlock words and clock times a comparable's prose names.
+
+    An annotation for the reason `dead_air_reason` gives, never a decision: the
+    final case's comparables and their prose are different ones, so the data
+    test has to stand on its own.
+    """
+    if not isinstance(comparable, dict):
+        return ""
+    text = comparable.get("unlock")
+    if not isinstance(text, str):
+        return ""
+    lowered = text.lower()
+    words = [word for word in DEAD_AIR_WORDS if word in lowered]
+    if not words:
+        return ""
+    times = [match.group(0) for match in PROSE_TIME.finditer(text)][:2]
+    said = "prose says " + "/".join(words)
+    return said + (" at " + ", ".join(times) if times else "")
+
+
+def dead_air_reason(curve, comparable, threshold=None):
+    """Why this comparable's hour 1 is dead air, or "" when it is not.
+
+    Hour 1 is dead air when the first print sits far below the level the curve
+    reaches in the next few hours: the store had not unlocked yet, or only a
+    pre-load stream was live, so v1 is a fraction of v2..v5 and every ratio
+    built on it is inflated.  The test is `v1 < threshold * max(v2..v5)`, read
+    off the comparable's own curve, so it keeps working when a case brings
+    comparables of its own with prose of their own.
+    """
+    if threshold is None:
+        threshold = DEAD_AIR_THRESHOLD
+    first = curve.get(FIRST_HOUR)
+    if first is None or first <= 0:
+        return ""
+    reference = early_peak(curve)
+    if reference is None or reference <= 0:
+        return ""
+    if first >= threshold * reference:
+        return ""
+    reason = (f"hour 1 is {first:g}, below {threshold:g} x the early peak "
+              f"{reference:g} at hours 2..5")
+    hint = prose_hint(comparable)
+    return reason + ("; " + hint if hint else "")
+
+
+def anchor_hour(curve):
+    """The first hour at or above REANCHOR_FRACTION of the release-day peak."""
+    peak = max(curve.values()) if curve else 0.0
+    if peak <= 0:
+        return FIRST_HOUR
+    for hour in range(FIRST_HOUR, LAST_HOUR + 1):
+        viewers = curve.get(hour)
+        if viewers is not None and viewers >= REANCHOR_FRACTION * peak:
+            return hour
+    return FIRST_HOUR
+
+
+def reanchored_ratios(curve):
+    """(ratios, base) normalised on the anchor hour instead of on hour 1.
+
+    The anchor -- the first hour at 60% of the release-day peak -- takes the
+    part hour 1 plays for a healthy launch, so the target's hour h is read off
+    the comparable's hour `h + anchor - 1`: the comparable's post-unlock shape
+    lands on the target's post-unlock hours instead of being squashed by its
+    dead first hour, and the returned `base` is the anchor's print, which is
+    what the scale weight compares with this case's hour 1.
+
+    The shift runs off the end of the curve for the late hours -- target hour h
+    wants comparable hour h + anchor - 1, which passes 24 once h > 25 - anchor
+    -- and there the last ratio seen is carried forward.  Holding the tail flat
+    keeps those hours in the sample; dropping them instead would thin hours
+    21..24 and hand them to the baseline, which is a random walk from this
+    case's hour-1 print and says nothing about the launch's shape.
+    """
+    anchor = anchor_hour(curve)
+    base = curve.get(anchor)
+    if base is None or base <= 0:
+        return {}, None
+    ratios = {}
+    last = None
+    for hour in FORECAST_HOURS:
+        viewers = curve.get(hour + anchor - FIRST_HOUR)
+        if viewers is not None and viewers > 0:
+            last = viewers / base
+        if last is not None:
+            ratios[hour] = last
+    return ratios, base
+
+
 # --------------------------------------------------------------------------
 # Step 3: weight each comparable three times
 # --------------------------------------------------------------------------
@@ -305,7 +442,11 @@ def build_profiles(case, p):
     """One (log-ratios, weight) pair per comparable that has a usable curve.
 
     A comparable whose release day has no first hour above zero, or no other
-    hour above zero, cannot speak for this case's shape and is dropped.
+    hour above zero, cannot speak for this case's shape and is dropped.  One
+    whose hour 1 is dead air is dropped or re-anchored, per DEAD_AIR_REPAIR:
+    its weight then compares the anchor's print, not the dead first hour, with
+    this case's first hour, so re-anchoring keeps it in the pool instead of
+    weighting it away.
     """
     comparables = case.get("comparables")
     if not isinstance(comparables, list):
@@ -314,11 +455,21 @@ def build_profiles(case, p):
     profiles = []
     for comparable in comparables:
         curve = release_day_curve(comparable)
-        ratios = normalised_ratios(curve)
+        if not curve:
+            continue
+        if dead_air_reason(curve, comparable):
+            if DEAD_AIR_REPAIR == REPAIR_DROP:
+                continue
+            if DEAD_AIR_REPAIR == REPAIR_REANCHOR:
+                ratios, base = reanchored_ratios(curve)
+            else:
+                ratios, base = normalised_ratios(curve), curve.get(FIRST_HOUR)
+        else:
+            ratios, base = normalised_ratios(curve), curve.get(FIRST_HOUR)
         if not ratios:
             continue
         weight = comparable_weight(
-            comparable.get("day_start"), curve.get(FIRST_HOUR), case_year, p,
+            comparable.get("day_start"), base, case_year, p,
             comparable.get("platforms"),
         )
         if weight <= 0:
