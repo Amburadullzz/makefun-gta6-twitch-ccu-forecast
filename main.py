@@ -7,8 +7,9 @@ matters is where each quantile sits in log space, not the raw viewer count.
 
 The model borrows the shape of past big launches: every comparable's release
 day is normalised to its own first hour, the resulting log-ratios are weighted
-by how recent the launch is and how close its first hour was to this case's
-first hour, pooled over neighbouring hours to thicken the sample, and read off
+by how recent the launch is, how close its first hour was to this case's first
+hour, and how close its platforms are to the target's (console-only, no PC at
+launch), pooled over neighbouring hours to thicken the sample, and read off
 as weighted empirical quantiles that are scaled back up from this case's hour-1
 print.  When a case has too few weighted observations for an hour the house
 baseline takes over: the first hour's print, with a log spread that widens like
@@ -23,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,6 +55,33 @@ RECENCY_DECAY = 0.75  # per year of distance from the case's own launch year
 SCALE_DECAY = 1.0  # exponent on the |ln v1 - ln p| scale penalty
 SIGMA_FLOOR = 0.02  # the pooled spread never collapses below this
 BASELINE_SIGMA = 0.15  # the house baseline's log spread per sqrt hour
+
+# The target's platforms are console-only: Grand Theft Auto VI ships on PS5 and
+# Xbox Series X|S with no PC version at launch, single-player, unlocking at
+# midnight local time country by country.  That is the prior the platform
+# weight encodes, and it is deliberately NOT read from the case: a case's
+# `comparables` name whatever they name, and the practice cases are other games
+# entirely.
+TARGET_PLATFORMS = "PS5, Xbox Series X|S"
+
+# Platform-similarity scores, closest to the target first.  A launch naming
+# PlayStation or Xbox and no PC scores highest; one naming consoles and PC
+# together sits in between; one that is PC-only, or lists PC ahead of the
+# consoles (a PC-first launch, whose hour 1 is often dead air before a store
+# unlock), scores lowest; a console of another family (Switch) sits low too.
+SIM_CONSOLE_ONLY = 1.0
+SIM_CONSOLE_AND_PC = 0.4
+SIM_OTHER_CONSOLE = 0.15
+SIM_PC_LEAD = 0.08
+SIM_UNKNOWN = 0.3  # no usable `platforms` string: neither endorsed nor damned
+
+# Exponent on the platform weight; 0 disables it, 1 is the similarity itself.
+# Swept with the leave-one-out harness in tools/loo_sweep.py: the console
+# launches' mean pinball loss falls from 0.3166 at 0.0 to 0.2727 at 0.5 and
+# rises again past it (0.2775 at 1.0, 0.2902 at 2.0), while the whole pool --
+# which is mostly the PC-led launches this weight deliberately demotes -- pays
+# a little (0.4135 to 0.4434).  0.5 is where the console pool is best.
+PLATFORM_EXPONENT = 0.5
 
 LOWEST = 1.0  # no quantile may sit below one viewer
 HIGHEST = 1e9  # ... nor above a billion
@@ -205,12 +234,61 @@ def normalised_ratios(curve):
 
 
 # --------------------------------------------------------------------------
-# Step 3: weight each comparable twice
+# Step 3: weight each comparable three times
 # --------------------------------------------------------------------------
 
 
-def comparable_weight(day_start, first_hour, case_year, p):
-    """Recency weight times scale weight; zero when the pair is unusable."""
+def names_playstation(text):
+    """True when a lowercase platform string names a PlayStation console."""
+    return "playstation" in text or re.search(r"\bps[0-9]", text) is not None
+
+
+def names_xbox(text):
+    """True when a lowercase platform string names an Xbox console."""
+    return "xbox" in text
+
+
+def names_pc(text):
+    """True when a lowercase platform string names the PC as a platform."""
+    return re.search(r"\bpc\b", text) is not None
+
+
+def platform_similarity(platforms):
+    """How close a comparable's platforms are to the console-only target.
+
+    A launch that names PlayStation or Xbox and no PC scores highest.  One
+    that names both a console and the PC, with the PC not leading, scores in
+    between.  One that is PC-only, or that lists the PC before the consoles (a
+    PC-first launch), scores lowest, and so does a console of another family.
+    The tiers encode TARGET_PLATFORMS; they are never read from the case.
+    """
+    if not isinstance(platforms, str) or not platforms.strip():
+        return SIM_UNKNOWN
+    text = platforms.lower()
+    pc_at = _first_position(text, r"\bpc\b")
+    console_at = _first_position(text, r"playstation|\bps[0-9]|xbox")
+    if pc_at is None:
+        if console_at is None:
+            return SIM_OTHER_CONSOLE  # a console, but neither PlayStation nor Xbox
+        return SIM_CONSOLE_ONLY
+    if console_at is None:
+        return SIM_PC_LEAD  # PC only
+    return SIM_PC_LEAD if pc_at < console_at else SIM_CONSOLE_AND_PC
+
+
+def _first_position(text, pattern):
+    """Where `pattern` first matches in `text`, or None when it never does."""
+    match = re.search(pattern, text)
+    return match.start() if match is not None else None
+
+
+def platform_weight(platforms):
+    """The similarity raised to PLATFORM_EXPONENT, always above zero."""
+    return platform_similarity(platforms) ** PLATFORM_EXPONENT
+
+
+def comparable_weight(day_start, first_hour, case_year, p, platforms=None):
+    """Recency times scale times platform weight; zero when unusable."""
     if first_hour is None or first_hour <= 0 or p <= 0:
         return 0.0
     start = parse_instant(day_start)
@@ -219,7 +297,7 @@ def comparable_weight(day_start, first_hour, case_year, p):
     else:
         recency = 1.0
     scale = math.exp(-SCALE_DECAY * abs(math.log(first_hour) - math.log(p)))
-    weight = recency * scale
+    weight = recency * scale * platform_weight(platforms)
     return weight if math.isfinite(weight) and weight > 0 else 0.0
 
 
@@ -240,7 +318,8 @@ def build_profiles(case, p):
         if not ratios:
             continue
         weight = comparable_weight(
-            comparable.get("day_start"), curve.get(FIRST_HOUR), case_year, p
+            comparable.get("day_start"), curve.get(FIRST_HOUR), case_year, p,
+            comparable.get("platforms"),
         )
         if weight <= 0:
             continue
